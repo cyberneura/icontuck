@@ -1,0 +1,585 @@
+name: Release
+
+# Manual only (workflow_dispatch); pushes never build. Start it with
+# `./scripts/release.sh`, which bumps the version first.
+on:
+  workflow_dispatch:
+
+# Creating the release and uploading assets needs contents: write.
+permissions:
+  contents: write
+
+# Serialize runs. One dispatch corresponds to one version, so a cancelled run
+# leaves that version permanently unpublished — its bump commit is already on
+# main.
+#
+# Only one dispatch is held while another runs; a third replaces the one waiting
+# and its version is never built. `queue: max` would be the knob for that, and
+# the other Cyberneura release workflows carry it (their runs succeed, so it is
+# not rejected), but it is absent from the documented syntax and its effect here
+# was never confirmed. Rather than depend on that, do not stack dispatches:
+# scripts/release.sh watches the run it started, so waiting for it is the
+# normal flow anyway.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    # Generous ceiling for a cold universal build plus an unpredictable wait on
+    # Apple's notary service. Normal runs finish well inside it.
+    timeout-minutes: 90
+
+    steps:
+      # persist-credentials: false — keep checkout from leaving a write-scoped
+      # GITHUB_TOKEN in .git/config where later steps could pick it up. Steps
+      # that need a token get one explicitly through env.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # An empty CODE_SIGN_IDENTITY does not fail the build: xcodebuild produces
+      # an ad-hoc, linker-signed app (measured). Later steps do catch it — the
+      # export's codesign --verify and notarytool both fail on empty input — but
+      # only after a full universal build. Failing here costs seconds instead.
+      - name: Verify signing secrets are present
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]}. The build would produce an unsigned, unnotarized app."
+            exit 1
+          fi
+          echo "All signing and notarization secrets are present."
+
+      # The project is built against the macOS 26 SDK. Pick the newest Xcode the
+      # runner image ships rather than pinning a path that disappears on the next
+      # image refresh.
+      - name: Select the newest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using ${LATEST}"
+          sudo xcode-select -s "${LATEST}"
+          xcodebuild -version
+          MAJOR=$(xcodebuild -version | awk 'NR == 1 { split($2, v, "."); print v[1] }')
+          # `[ "" -lt 26 ]` exits 2, which an `if` condition reads as false and
+          # `set -e` ignores — the guard would pass silently on a parse failure.
+          case "${MAJOR}" in
+            '' | *[!0-9]*)
+              echo "::error::Could not parse the Xcode version from 'xcodebuild -version'."
+              exit 1
+              ;;
+          esac
+          if [ "${MAJOR}" -lt 26 ]; then
+            echo "::error::Xcode 26 or later is required (runner has ${MAJOR})."
+            exit 1
+          fi
+
+      - name: Import Apple Developer certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # The keychain password is single-use, so it is generated here instead
+          # of being carried as a secret.
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          # codesign resolves identities through the search list, not the default
+          # keychain, so put it there explicitly.
+          security list-keychains -d user -s build.keychain
+          # find-identity exits 0 even with zero identities, so grep decides.
+          # Failing here is far easier to diagnose than a signing error deep in
+          # the build.
+          security find-identity -v -p codesigning
+          security find-identity -v -p codesigning | grep -q "Developer ID Application" || {
+            echo "Error: no 'Developer ID Application' identity in the keychain search list" >&2
+            exit 1
+          }
+          rm "$RUNNER_TEMP/certificate.p12"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(./scripts/version.sh)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "dmg=Icontuck_${VERSION}_universal.dmg" >> "$GITHUB_OUTPUT"
+          echo "Releasing v${VERSION}"
+
+      # scripts/release.sh refuses to number a release that would not move
+      # forward, but this workflow can also be dispatched straight from the GitHub
+      # UI, where none of its guards run. This is the only check on the path that
+      # actually publishes, so it has to stand on its own, and it has to fail
+      # closed: an API error must not read as "nothing published yet".
+      #
+      # It guards the marketing version, which is what the tag, the dmg name and
+      # the Homebrew cask carry. CFBundleVersion is deliberately left to
+      # release.sh. Release metadata does not record it, but it is not
+      # unobtainable: it could be read out of project.pbxproj at the highest
+      # release's tag. That is a second remote fetch and a second parser for a
+      # number nothing in the distribution path reads today — the app has no
+      # updater and Homebrew compares cask versions — so the gap is accepted
+      # rather than impossible to close. Launch Services does consult
+      # CFBundleVersion when several copies of the same bundle id exist, and an
+      # updater would depend on it outright; either makes closing it worthwhile.
+      - name: Check the release is new and moves forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The default shell is `bash -e` without pipefail, so a gh failure in a
+          # pipeline below would be masked by the exit status of `tail`.
+          set -o pipefail
+
+          # workflow_dispatch lets the UI pick any branch, and nothing else here
+          # would notice a release cut from an unmerged one.
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main only (got ${GITHUB_REF})."
+            exit 1
+          fi
+
+          # matching-refs answers 200 with an empty array when nothing matches, so
+          # there is no 404 to tell apart from a transport error and any failure
+          # leaves through `set -e`. Checking the response body for "Not Found"
+          # instead would accept any error message that happens to contain it.
+          # The endpoint matches by prefix, hence the exact-ref filter.
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v${VERSION}" \
+            --jq "[.[] | select(.ref == \"refs/tags/v${VERSION}\")] | length")
+          if [ "${EXISTING}" != "0" ]; then
+            echo "::error::Tag v${VERSION} already exists. --target only places a tag gh creates itself, so the release would be built against wherever that tag already points."
+            exit 1
+          fi
+
+          # GitHub puts no uniqueness constraint on a draft's tag_name, so several
+          # drafts can sit on the same pending tag — a failed run leaves one behind
+          # and the next run happily adds another. Requiring that no release
+          # carries this tag keeps a leftover draft from being the one published;
+          # the release created below is then pinned by id, which is what actually
+          # removes the ambiguity.
+          #
+          # Counted by streaming ids into wc rather than with a jq `length`:
+          # --paginate applies the filter per page, so an aggregate would come back
+          # as one number per page instead of one total.
+          RELEASES=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq ".[] | select(.tag_name == \"v${VERSION}\") | .id" | wc -l | tr -d ' ')
+          if [ "${RELEASES}" != "0" ]; then
+            echo "::error::${RELEASES} release(s) already carry the tag v${VERSION}, including drafts. Delete them before releasing this version."
+            exit 1
+          fi
+
+          # Compare against the highest published version rather than the most
+          # recently created one: releases come back in creation order, so a draft
+          # published later would not be the first row. --paginate walks every
+          # page; a --limit would silently drop the highest version once the
+          # repository has more releases than the page it asks for.
+          HIGHEST=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '.[] | select(.draft == false) | .tag_name' \
+            | sed 's/^v//' | sort -V | tail -1)
+          if [ -n "${HIGHEST}" ]; then
+            TOP=$(printf '%s\n%s\n' "${HIGHEST}" "${VERSION}" | sort -V | tail -1)
+            if [ "${VERSION}" = "${HIGHEST}" ] || [ "${TOP}" != "${VERSION}" ]; then
+              echo "::error::Version ${VERSION} does not move forward from the highest published release v${HIGHEST}."
+              exit 1
+            fi
+          fi
+          echo "v${VERSION} is new (highest published: ${HIGHEST:-none})."
+
+      # ARCHS is set explicitly: the project leaves ONLY_ACTIVE_ARCH on, which on
+      # an Apple Silicon runner would produce an arm64-only build and silently
+      # drop Intel support from a dmg named "universal".
+      - name: Archive
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodebuild archive \
+            -project Icontuck.xcodeproj \
+            -scheme Icontuck \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Icontuck.xcarchive" \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$APPLE_SIGNING_IDENTITY" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp"
+
+      # Export is expected to re-sign the app with the Developer ID identity and
+      # produce the distributable bundle. The app links no third-party framework,
+      # so there is nothing embedded to re-sign. This path has never been run
+      # locally, so it is the first thing to suspect if the first release breaks.
+      - name: Export
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>developer-id</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Developer ID Application</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Icontuck.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          APP="$RUNNER_TEMP/export/Icontuck.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          # Assert rather than print: a dropped ARCHS would otherwise ship an
+          # arm64-only build inside a dmg named "universal".
+          ARCH_LIST=$(lipo -archs "$APP/Contents/MacOS/Icontuck")
+          echo "Architectures: ${ARCH_LIST}"
+          for arch in arm64 x86_64; do
+            case " ${ARCH_LIST} " in
+              *" ${arch} "*) ;;
+              *) echo "::error::${arch} missing from the built binary."; exit 1 ;;
+            esac
+          done
+          # Info.plist carries $(MARKETING_VERSION) and $(CURRENT_PROJECT_VERSION);
+          # catch either drifting from the project if that indirection is ever
+          # removed, or the build settings failing to expand at all.
+          BUNDLE_VERSION=$(defaults read "$APP/Contents/Info" CFBundleShortVersionString)
+          if [ "${BUNDLE_VERSION}" != "${VERSION}" ]; then
+            echo "::error::CFBundleShortVersionString is ${BUNDLE_VERSION}, expected ${VERSION}."
+            exit 1
+          fi
+          BUNDLE_BUILD=$(defaults read "$APP/Contents/Info" CFBundleVersion)
+          EXPECTED_BUILD=$(./scripts/version.sh build)
+          if [ "${BUNDLE_BUILD}" != "${EXPECTED_BUILD}" ]; then
+            echo "::error::CFBundleVersion is ${BUNDLE_BUILD}, expected ${EXPECTED_BUILD}."
+            exit 1
+          fi
+
+      - name: Create dmg
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          DMG: ${{ steps.version.outputs.dmg }}
+        run: |
+          STAGE="$RUNNER_TEMP/dmg-root"
+          mkdir -p "$STAGE"
+          cp -R "$RUNNER_TEMP/export/Icontuck.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname Icontuck -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          # Notarization accepts an unsigned dmg, but signing it lets Gatekeeper
+          # validate the container itself rather than only the app inside.
+          codesign --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG"
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DMG: ${{ steps.version.outputs.dmg }}
+        run: |
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+          # Confirm the ticket is actually attached; stapler can report success
+          # against a cached ticket while the asset carries none.
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature -v "$DMG"
+
+      # Created as a draft so a failure later in the job never leaves a
+      # half-finished release visible. The publish job flips it.
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DMG: ${{ steps.version.outputs.dmg }}
+        run: |
+          set -o pipefail
+
+          # The guard before the build ran tens of minutes ago and concurrency only
+          # serialises this workflow, so re-check that the tag is still absent: one
+          # created since would be reused when the release is published instead of
+          # --target placing a new one. Checked before the release is created so a
+          # hit leaves no orphan draft to delete by hand before the next attempt.
+          #
+          # Absence is all that is checkable here. A draft release stores tag_name
+          # and target_commitish but does not create the git tag — that happens
+          # when the publish job clears the draft flag — so there is no tag yet to
+          # compare a commit against. The publish job makes that comparison.
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v${VERSION}" \
+            --jq "[.[] | select(.ref == \"refs/tags/v${VERSION}\")] | length")
+          if [ "${EXISTING}" != "0" ]; then
+            echo "::error::Tag v${VERSION} appeared during the build; publishing would reuse it instead of tagging ${GITHUB_SHA}."
+            exit 1
+          fi
+
+          RELEASES=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq ".[] | select(.tag_name == \"v${VERSION}\") | .id" | wc -l | tr -d ' ')
+          if [ "${RELEASES}" != "0" ]; then
+            echo "::error::A release carrying the tag v${VERSION} appeared during the build; the draft created here would not be the one published."
+            exit 1
+          fi
+
+          # --target pins the tag to the commit this run built. Without it gh
+          # creates the tag on the default branch's tip at that moment, so a push
+          # landing during the build and notarization (tens of minutes) would tag
+          # a commit the dmg was not built from.
+          # The marker is what makes the release identifiable further down. Nothing
+          # else about a draft is unique: the dmg name is derived from the version,
+          # so anyone releasing the same version produces a draft that looks
+          # exactly like this one.
+          # Attempt included: a re-run keeps GITHUB_RUN_ID and only increments
+          # GITHUB_RUN_ATTEMPT, so the id alone would give two attempts of the same
+          # run identical markers — and a draft left by the earlier attempt is
+          # exactly the thing this has to tell apart. The closing ` -->` is load
+          # bearing for the same reason: matching is a substring test, so without a
+          # terminator attempt 1 would match attempt 11, and run 12345 run 123456.
+          MARKER="<!-- icontuck-run: ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} -->"
+          gh release create "v${VERSION}" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Icontuck v${VERSION}" \
+            --notes "Signed and notarized universal build."$'\n\n'"${MARKER}" \
+            "$DMG"
+
+          # Pin the release by id. `gh release edit <tag>` resolves by name, and a
+          # draft carrying the same tag_name can appear at any point — a draft
+          # creates no tag, so none of the tag checks would see it — leaving the
+          # publish free to pick an older draft with no dmg attached. The publish
+          # job addresses the id read here instead of a name.
+          #
+          # The list endpoint is served from a search index that lags writes, so a
+          # release that was just created can be missing from it (this is why gh
+          # itself stopped resolving releases through this endpoint). Polling
+          # absorbs that; the id is only accepted once the release it names carries
+          # this run's marker. A stale page showing somebody else's draft therefore
+          # does not settle the question, and two matches never do.
+          #
+          # The marker is the only thing that identifies the individual. Being a
+          # draft, carrying a dmg of the right name, even pointing at this commit
+          # are all properties another actor releasing the same version from the
+          # same commit would reproduce; the run id is not.
+          #
+          # Everything expensive is already done at this point, so a transient API
+          # error must not throw it away: inside the loop a failed read is just
+          # "cannot tell yet" and the next round tries again. The loop still gives
+          # up loudly once the attempts run out.
+          #
+          # Swallowing the failure is not enough to make that true. On an HTTP
+          # error gh skips the --jq filter and prints the response body on stdout,
+          # so a captured value is `{"message":"Not Found",...}` rather than the
+          # empty string; unchecked, that body counts as one id, and feeding it to
+          # `.assets[]` makes jq exit 5, which pipefail turns into the very step
+          # failure this retry exists to avoid. So each read is judged by its exit
+          # status first and by the shape of what came back second — never by
+          # being non-empty.
+          RELEASE_ID=""
+          for _ in $(seq 1 30); do
+            # The status is what decides, not the output. --paginate streams page
+            # by page, so a failure on a later page still leaves the earlier pages
+            # in IDS — digits and newlines, indistinguishable by shape from a
+            # complete answer. Acting on that would let an API error turn "two
+            # releases carry this tag" into "one", which is the case that must
+            # never be guessed at.
+            if ! IDS=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+              --jq ".[] | select(.tag_name == \"v${VERSION}\") | .id"); then
+              echo "Could not list the releases carrying v${VERSION}; retrying."
+              sleep 2
+              continue
+            fi
+            if printf '%s' "${IDS}" | grep -qv '^[0-9]*$'; then
+              echo "Unexpected listing for v${VERSION}; retrying."
+              sleep 2
+              continue
+            fi
+            COUNT=$(printf '%s' "${IDS}" | grep -c . || true)
+            case "${COUNT}" in
+              '' | *[!0-9]*)
+                echo "::error::Could not count the releases carrying v${VERSION}: ${COUNT}"
+                exit 1
+                ;;
+            esac
+            if [ "${COUNT}" -gt 1 ]; then
+              echo "::error::${COUNT} releases carry the tag v${VERSION}; one of them appeared alongside this run's."
+              exit 1
+            fi
+            if [ "${COUNT}" -eq 1 ]; then
+              DETAIL=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${IDS}" || true)
+              DETAIL_ID=$(printf '%s' "${DETAIL}" | jq -r '.id? // empty' 2>/dev/null || true)
+              if [ "${DETAIL_ID}" != "${IDS}" ]; then
+                echo "Could not read release ${IDS}; retrying."
+                sleep 2
+                continue
+              fi
+              TARGET=$(printf '%s' "${DETAIL}" | jq -r '.target_commitish')
+              IS_DRAFT=$(printf '%s' "${DETAIL}" | jq -r '.draft')
+              HAS_DMG=$(printf '%s' "${DETAIL}" | jq -r --arg name "${DMG}" '[(.assets // [])[] | select(.name == $name)] | length')
+              IS_OURS=$(printf '%s' "${DETAIL}" | jq -r --arg marker "${MARKER}" '(.body // "") | contains($marker)')
+              if [ "${IS_OURS}" = "true" ] && [ "${IS_DRAFT}" = "true" ] && [ "${HAS_DMG}" = "1" ] && [ "${TARGET}" = "${GITHUB_SHA}" ]; then
+                RELEASE_ID="${IDS}"
+                echo "Release ${IDS} is this run's (v${VERSION}, ${DMG}, ${TARGET})."
+                break
+              fi
+              echo "Release ${IDS} carries v${VERSION} but is not this run's (ours=${IS_OURS} draft=${IS_DRAFT} dmg=${HAS_DMG} target=${TARGET}); waiting."
+            fi
+            sleep 2
+          done
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "::error::The release just created for v${VERSION} did not become identifiable within 60 seconds."
+            exit 1
+          fi
+          echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+          echo "Created release ${RELEASE_ID} for v${VERSION}."
+
+      # The tap is updated by hand, so hand the two values it needs to the run
+      # summary instead of making someone download the dmg to hash it.
+      - name: Print cask fields
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DMG: ${{ steps.version.outputs.dmg }}
+        run: |
+          # The hash is taken in its own assignment, not inline in the echo: a
+          # pipeline inside a command substitution reports the exit status of the
+          # surrounding command, so `set -o pipefail` would not stop an empty
+          # sha256 from reaching the summary — and that is the value someone
+          # pastes into the tap.
+          set -o pipefail
+          SHA256=$(shasum -a 256 "$DMG" | cut -d' ' -f1)
+          case "${SHA256}" in
+            '' | *[!0-9a-f]*)
+              echo "::error::Unexpected sha256 for ${DMG}: ${SHA256}"
+              exit 1
+              ;;
+          esac
+          if [ "${#SHA256}" -ne 64 ]; then
+            echo "::error::sha256 for ${DMG} is ${#SHA256} characters, expected 64: ${SHA256}"
+            exit 1
+          fi
+          {
+            echo '## Casks/icontuck.rb'
+            echo '```ruby'
+            echo "  version \"${VERSION}\""
+            echo "  sha256 \"${SHA256}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Publish only once the build succeeded; a failed run leaves the draft behind.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Clearing the draft flag is what creates the git tag, so this is the first
+      # moment the tag can be checked against the commit that was built. If it
+      # landed on another commit the tag already existed, and the release goes
+      # back to draft rather than staying published against the wrong one.
+      #
+      # Failing to *read* the ref is deliberately not treated the same way: the
+      # job fails with the release left published. Pulling a release that is
+      # almost certainly correct because of a rate limit or a propagation lag is
+      # the worse outcome, and a red job on a published release asks for a look.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.build.outputs.release_id }}
+        run: |
+          set -o pipefail
+          VERSION=$(./scripts/version.sh)
+
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "::error::The build job did not report a release id."
+            exit 1
+          fi
+
+          # An annotated tag's ref points at the tag object, not the commit.
+          resolve_tag_sha() {
+            local ref type sha
+            ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}")
+            type=$(printf '%s' "${ref}" | jq -r '.object.type')
+            sha=$(printf '%s' "${ref}" | jq -r '.object.sha')
+            if [ "${type}" = "tag" ]; then
+              sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq '.object.sha')
+            fi
+            printf '%s' "${sha}"
+          }
+
+          # Publishing is what creates the tag, so the tag cannot be verified
+          # before the fact — only its absence. Checking here shrinks the window in
+          # which a conflicting tag could appear from the length of the build down
+          # to the moments around the publish call.
+          #
+          # A tag that already points at this run's commit is this job's own work:
+          # publishing can succeed and the check below still fail on a transient
+          # read error, leaving the release published and the job red, and the
+          # obvious response to that is to re-run the job. Refusing on the mere
+          # existence of the tag would make that re-run impossible.
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v${VERSION}" \
+            --jq "[.[] | select(.ref == \"refs/tags/v${VERSION}\")] | length")
+          if [ "${EXISTING}" != "0" ]; then
+            PRE_SHA=$(resolve_tag_sha)
+            if [ "${PRE_SHA}" != "${GITHUB_SHA}" ]; then
+              # The tag belongs to someone else, so publishing must not go ahead.
+              # But a previous attempt of this job may have published and then
+              # failed to put the release back — the rollback PATCH can fail too.
+              # Exiting here without retrying it would leave a wrong release
+              # published with no run able to repair it, so retry first.
+              STATE=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '.draft')
+              if [ "${STATE}" = "false" ]; then
+                gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+                  -F draft=true --silent
+                echo "Release ${RELEASE_ID} was left published by an earlier attempt; put back to draft."
+              fi
+              echo "::error::Tag v${VERSION} already exists and points at ${PRE_SHA}, not the commit this run built (${GITHUB_SHA}). Publishing would reuse it."
+              exit 1
+            fi
+            echo "Tag v${VERSION} already points at ${GITHUB_SHA}; this is a re-run after a partial publish."
+          fi
+
+          # By id, not by tag: another draft on the same pending tag would make a
+          # name lookup ambiguous, and this is the release the dmg was attached to.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest=true --silent
+
+          TAG_SHA=$(resolve_tag_sha)
+          if [ "${TAG_SHA}" != "${GITHUB_SHA}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -F draft=true --silent
+            echo "::error::Tag v${VERSION} points at ${TAG_SHA}, not the commit this run built (${GITHUB_SHA}). The release was put back to draft."
+            exit 1
+          fi
