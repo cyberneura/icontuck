@@ -10,15 +10,19 @@ permissions:
   contents: write
 
 # Serialize runs. One dispatch corresponds to one version, so a cancelled run
-# leaves that version permanently unpublished (its bump commit is already on
-# main). `queue: max` is carried over from the other Cyberneura release
-# workflows, where it is accepted and runs succeed; whether it actually changes
-# queuing behaviour here has not been confirmed, so do not rely on more than one
-# dispatch being held.
+# leaves that version permanently unpublished — its bump commit is already on
+# main.
+#
+# Only one dispatch is held while another runs; a third replaces the one waiting
+# and its version is never built. `queue: max` would be the knob for that, and
+# the other Cyberneura release workflows carry it (their runs succeed, so it is
+# not rejected), but it is absent from the documented syntax and its effect here
+# was never confirmed. Rather than depend on that, do not stack dispatches:
+# scripts/release.sh watches the run it started, so waiting for it is the
+# normal flow anyway.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
-  queue: max
 
 jobs:
   build:
