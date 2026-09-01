@@ -1,9 +1,11 @@
 import SwiftUI
 import ServiceManagement
 
-enum PreferenceKey {
-    static let showSeparator = "showSeparator"
-    static let autoHideWhenInactive = "autoHideWhenInactive"
+/// Named `PreferenceKeys` because `PreferenceKey` collides with the SwiftUI
+/// protocol of that name and leaves the editor resolving every use to it.
+enum PreferenceKeys {
+    static let iconsHidden = "iconsHidden"
+    static let followDisplayConfiguration = "followDisplayConfiguration"
 }
 
 extension Notification.Name {
@@ -11,31 +13,44 @@ extension Notification.Name {
 }
 
 struct PreferencesView: View {
-    @AppStorage(PreferenceKey.showSeparator) private var showSeparator = true
-    @AppStorage(PreferenceKey.autoHideWhenInactive) private var autoHideWhenInactive = false
+    @AppStorage(PreferenceKeys.iconsHidden) private var iconsHidden = false
+    @AppStorage(PreferenceKeys.followDisplayConfiguration) private var followDisplayConfiguration = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
 
     var body: some View {
         Form {
-            Toggle("Launch at login", isOn: Binding(
-                get: { launchAtLogin },
-                set: updateLaunchAtLogin
-            ))
-            Toggle("Show separator", isOn: $showSeparator)
-            Toggle("Auto-hide when inactive", isOn: $autoHideWhenInactive)
-
-            if let loginError {
-                Text(loginError)
+            Section {
+                Toggle("Hide icons", isOn: $iconsHidden)
+                Text("Icons to the left of the Icontuck icon are tucked off screen. Command-drag the Icontuck icon to move the boundary.")
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Hide when only the built-in display is connected", isOn: $followDisplayConfiguration)
+                Text("Applied at launch and whenever a display is attached or removed. Clicking the icon overrides it until the next change.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Launch at login", isOn: Binding(
+                    get: { launchAtLogin },
+                    set: updateLaunchAtLogin
+                ))
+                if let loginError {
+                    Text(loginError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
         }
         .formStyle(.grouped)
         .padding(12)
-        .frame(width: 420, height: 190)
-        .onChange(of: showSeparator) { _, _ in notifyChanged() }
-        .onChange(of: autoHideWhenInactive) { _, _ in notifyChanged() }
+        .frame(width: 420, height: 250)
+        .onChange(of: iconsHidden) { _, _ in notifyChanged() }
+        .onChange(of: followDisplayConfiguration) { _, _ in notifyChanged() }
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
@@ -61,4 +76,3 @@ struct PreferencesView: View {
 #Preview {
     PreferencesView()
 }
-
