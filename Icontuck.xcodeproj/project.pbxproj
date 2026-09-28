@@ -9,6 +9,7 @@
 		A10000000000000000000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* AppDelegate.swift */; };
 		A10000000000000000000002 /* SeparatorManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SeparatorManager.swift */; };
 		A10000000000000000000003 /* PreferencesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* PreferencesView.swift */; };
+		A10000000000000000000005 /* ThirdPartyNotices.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* ThirdPartyNotices.swift */; };
 		A10000000000000000000004 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -21,6 +22,7 @@
 		A20000000000000000000006 /* Icontuck.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Icontuck.entitlements; sourceTree = "<group>"; };
 		A20000000000000000000007 /* Icontuck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Icontuck.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000008 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000009 /* ThirdPartyNotices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThirdPartyNotices.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -40,7 +42,7 @@
 		};
 		A40000000000000000000002 /* Icontuck */ = {
 			isa = PBXGroup;
-			children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000004, A20000000000000000000006, A20000000000000000000005,);
+			children = (A20000000000000000000001, A20000000000000000000002, A20000000000000000000003, A20000000000000000000009, A20000000000000000000004, A20000000000000000000006, A20000000000000000000005,);
 			path = Icontuck;
 			sourceTree = "<group>";
 		};
@@ -83,7 +85,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A30000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003,); runOnlyForDeploymentPostprocessing = 0; };
+		A30000000000000000000002 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001, A10000000000000000000002, A10000000000000000000003, A10000000000000000000005,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */

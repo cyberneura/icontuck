@@ -35,7 +35,7 @@ The app is an agent (`LSUIElement`) and appears only in the menu bar.
 ## Usage
 
 - **Left click** the Icontuck icon to hide or show icons.
-- **Right click** (or Control-click) for preferences and quit.
+- **Right click** (or Control-click) for preferences, third-party licenses and quit.
 - **Command-drag** the Icontuck icon to move the boundary between the icons that get tucked and the ones that stay.
 
 Hiding tucks every icon to the *left* of the Icontuck icon off the screen edge. Icons to its right are unaffected. On first launch the icon is placed at the right end of the third-party group, so the first click hides all of them.
@@ -120,6 +120,23 @@ The cask in [cyberneura/homebrew-tap](https://github.com/cyberneura/homebrew-tap
 ```
 
 Copy them into `Casks/icontuck.rb` and push the tap.
+
+## License
+
+Icontuck is released under the [MIT License](LICENSE).
+
+## Third-party licenses
+
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) lists the licenses of the third-party libraries shipped inside the app. Icontuck currently bundles none: it links only Apple's system frameworks, which are part of macOS. The same text is shown in the app under **Right click → Third-Party Licenses…**.
+
+The file is generated, together with `Icontuck/ThirdPartyNotices.swift` that embeds it in the binary. Regenerate both and commit the result whenever a dependency is added or updated:
+
+```shell
+./scripts/generate-third-party-notices.sh          # rewrite both files
+./scripts/generate-third-party-notices.sh --check  # exit 1 if either is stale (run by the Test workflow)
+```
+
+The script refuses to run once the project gains a Swift package dependency; it has to be extended to copy each package's license first.
 
 ## App icon
 

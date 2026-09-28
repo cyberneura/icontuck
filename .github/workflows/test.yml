@@ -1,0 +1,60 @@
+name: Test
+
+# Pull request checks. Release builds stay in release.yml (manual only); this
+# workflow signs nothing and reads no secret.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  notices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Fails when THIRD-PARTY-NOTICES.txt or the Swift file embedding it no
+      # longer matches what the generator writes, or when a Swift package
+      # dependency was added without extending the generator.
+      - name: Third-party notices are up to date
+        run: ./scripts/generate-third-party-notices.sh --check
+
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Same selection as release.yml: the project needs the macOS 26 SDK.
+      - name: Select the newest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "Using ${LATEST}"
+          sudo xcode-select -s "${LATEST}"
+          xcodebuild -version
+
+      # Compile only. Signing is disabled because a pull request has no access
+      # to the Developer ID secrets, and an unsigned Debug build is enough to
+      # catch compile errors.
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project Icontuck.xcodeproj \
+            -scheme Icontuck \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=""
