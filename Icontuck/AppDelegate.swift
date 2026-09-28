@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controlItem: NSStatusItem!
     private let separatorManager = SeparatorManager()
     private var preferencesWindowController: NSWindowController?
+    private var licensesWindowController: NSWindowController?
     private var observers: [NSObjectProtocol] = []
     private var followsDisplayConfiguration = false
     private lazy var contextMenu = makeContextMenu()
@@ -63,6 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let preferencesItem = menu.addItem(withTitle: "Preferences…", action: #selector(showPreferences), keyEquivalent: ",")
         preferencesItem.target = self
+        let licensesItem = menu.addItem(withTitle: "Third-Party Licenses…", action: #selector(showThirdPartyLicenses), keyEquivalent: "")
+        licensesItem.target = self
         menu.addItem(.separator())
         let quitItem = menu.addItem(withTitle: "Quit Icontuck", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
@@ -221,6 +224,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         preferencesWindowController?.showWindow(nil)
         preferencesWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - Third-party licenses window
+
+    /// Shows THIRD-PARTY-NOTICES.txt, embedded at build time through the generated
+    /// ThirdPartyNotices.swift so the bundle never reads a file at run time.
+    @objc private func showThirdPartyLicenses() {
+        if licensesWindowController == nil {
+            let scrollView = NSTextView.scrollableTextView()
+            scrollView.hasVerticalScroller = true
+            if let textView = scrollView.documentView as? NSTextView {
+                textView.isEditable = false
+                textView.isSelectable = true
+                textView.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+                textView.textContainerInset = NSSize(width: 8, height: 8)
+                textView.string = ThirdPartyNotices.text
+            }
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
+                styleMask: [.titled, .closable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Third-Party Licenses"
+            window.contentView = scrollView
+            window.isReleasedWhenClosed = false
+            window.center()
+            licensesWindowController = NSWindowController(window: window)
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        licensesWindowController?.showWindow(nil)
+        licensesWindowController?.window?.makeKeyAndOrderFront(nil)
     }
 }
 
