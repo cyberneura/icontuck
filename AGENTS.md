@@ -13,4 +13,4 @@
 
 - `Icontuck.xcodeproj/project.pbxproj` はファイル同期グループではない。Swift ファイルを足す時は PBXBuildFile / PBXFileReference / グループの children / Sources ビルドフェーズの 4 か所に登録する。
 - Swift はこのリポジトリの PR の Test ワークフロー (macOS、署名なし Debug ビルド) でコンパイルを確認する。
-- バージョンは `./scripts/release.sh [patch|minor|major]` だけが上げる (main に直接 push して Release ワークフローを起動する)。PR では `MARKETING_VERSION` を上げない。
+- バージョンは通常 `./scripts/release.sh [patch|minor|major]` が上げる (main に直接 push して Release ワークフローを起動する)。機能追加の PR で `MARKETING_VERSION` を上げた場合 (`CURRENT_PROJECT_VERSION` も +1 する) は、マージ後に release.sh を使わず `gh workflow run release.yml --ref main` で Release ワークフローを直接起動する。release.sh は常に「次の番号」を切るので、PR で上げた番号が公開されずに飛ぶ。
