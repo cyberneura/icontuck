@@ -96,6 +96,14 @@ gh secret set APPLE_TEAM_ID -R cyberneura/icontuck
 
 The script refuses to run unless the working tree is clean and `HEAD` matches `origin/main`. It bumps `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in the project file, commits, pushes, triggers the workflow and watches it. The version is incremented on every release, so a run can never collide with an already published tag.
 
+If a pull request already raised `MARKETING_VERSION` (a feature PR may bump the minor version together with `CURRENT_PROJECT_VERSION`), do not run the script: it would cut the *next* number and leave the bumped one unpublished. Publish exactly the version on `main` by dispatching the workflow directly:
+
+```shell
+gh workflow run release.yml --repo cyberneura/icontuck --ref main
+```
+
+The workflow reads the version through `scripts/version.sh` and applies the same guards (unique tag, no leftover draft, higher than the highest published version) either way.
+
 A draft release is created before the workflow finishes, and a draft does not create the git tag — that happens when the release is published.
 
 If a run fails after the draft exists, delete the draft. GitHub does not require a draft's tag name to be unique, so a second run on the same version would add another draft on the same pending tag. The workflow publishes by release id rather than by tag name, and it establishes that id by looking for a release whose body carries this run attempt's own marker — nothing else about a draft is unique, since the dmg name follows from the version. What a leftover draft does break is the step that finds it: two releases on the tag is treated as an error rather than a guess. That is why the workflow refuses to run while any release already carries the version's tag.
