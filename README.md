@@ -2,6 +2,8 @@
 
 Icontuck is a sandbox-compatible macOS menu bar utility that uses a deliberately wide `NSStatusItem` to tuck menu bar items off the left edge. It calls no private API and requires no Accessibility or Screen Recording permission.
 
+Website: https://www.cyberneura.com/app/icontuck
+
 ## Install
 
 ```shell
